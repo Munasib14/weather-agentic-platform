@@ -1,0 +1,264 @@
+🌦️ Weather Multi-Agent Platform (Agentic AI)
+
+A locally run, fully agentic weather assistant built with LangGraph, MCP (Model Context Protocol), FastAPI and Streamlit.
+
+A Planner (supervisor LLM) observes the state and decides the next step. It replans after every result, including failures.
+Three worker agents are autonomous tool-using LLM agents. Each one chooses which MCP tool to call, with which arguments, and self-corrects when a call fails.
+All external access goes through one local MCP server: geocoding, weather, and risk rules.
+Table of Contents
+What makes it agentic
+Architecture
+Workflow
+Agents
+MCP Tools and Data Sources
+Replanning and Self-Correction
+Shared State
+Project Structure
+Setup and Run
+API Reference
+Example Walkthroughs
+Guardrails
+Troubleshooting
+Limitations and Ideas
+What makes it agentic
+Capability	How it is implemented
+Autonomy in routing	The Planner LLM chooses the next worker on every loop. There is no fixed pipeline.
+Tool selection by the LLM	Workers are ReAct-style agents. The LLM sees the MCP tool schemas and decides which tool to call and with what arguments.
+Self-correction (inside an agent)	GeocodeWorker retries geocode_location with other spellings or a country (e.g. Dilli → Delhi).
+Replanning (across agents)	A failed worker becomes an observation. The Planner then retries with a different instruction, changes approach, or explains the failure honestly.
+Memory	LangGraph MemorySaver per thread_id. Final answers are stored as AIMessages so follow-up questions have context.
+Standard tool layer	Every external call is an MCP tool on the local server over stdio.
+Architecture
+┌──────────────┐  HTTP   ┌──────────────────┐        ┌──────────────────────────┐
+│ Streamlit UI │ ──────► │ FastAPI backend  │ ─────► │ LangGraph workflow       │
+│   (app.py)   │ ◄────── │   (backend.py)   │ ◄───── │ (workflow.py + agents.py)│
+└──────────────┘  JSON   └──────────────────┘        └────────────┬─────────────┘
+                                                                  │
+                          ┌───────────────────────────────────────┼────────────────┐
+                          ▼                                       ▼                ▼
+                 ┌───────────────────┐                  ┌───────────────┐   ┌────────────┐
+                 │ Worker agents     │  stdio (MCP)     │ Planner LLM   │   │ Worker LLM │
+                 │ Geocode/Weather/  │ ───────────────► │ (supervisor)  │   │ (Groq,     │
+                 │ Safety            │                  └───────────────┘   │ tool-call) │
+                 └─────────┬─────────┘                                      └────────────┘
+                           ▼
+                 ┌───────────────────────────┐
+                 │ MCP server (mcp_server.py)│
+                 └──┬─────────┬──────────┬───┘
+                    ▼         ▼          ▼
+             Nominatim   Open-Meteo   Local risk
+             (OSM)       (weather)    rules
+
+The MCP server and client run on the same machine. A worker launches mcp_server.py as a child process over stdio, so there is no extra port or process to manage.
+
+Workflow
+
+The graph is hub-and-spoke. The Planner is called again after every worker.
+
+GeocodeWorker
+WeatherFetchWorker
+SafetyWorker
+FinalResponse
+result or failure
+result or failure
+result or failure
+START
+🧭 Planner
+📍 GeocodeWorker
+🌡️ WeatherFetchWorker
+🛡️ SafetyWorker
+END
+The loop
+A question arrives. The backend calls the graph with the session's thread_id.
+Planner observes the question, the collected data, the observation log and the attempt counts.
+Planner decides one step and returns structured output: reasoning → next_worker → task_instruction → final_answer (only when finishing).
+A worker agent runs. It opens an MCP session, lets the LLM pick tools, then reports success or failure through a finish tool.
+The result is written to state as an observation, plus data on success.
+Back to step 2. The Planner replans using the new observation. The loop ends when the Planner chooses FinalResponse or a guardrail stops it.
+Routing examples (decided by the LLM, not hard-coded)
+User question	Typical path
+"Where is Pune?"	Planner → 📍 → Planner
+"Weather at 28.61, 77.21"	Planner → 🌡️ → Planner
+"Weather in Dilli tomorrow"	Planner → 📍 (self-corrects Dilli→Delhi) → Planner → 🌡️ (get_daily_forecast) → Planner
+"Is it safe to fly a drone in Mumbai?"	Planner → 📍 → Planner → 🌡️ → Planner → 🛡️ → Planner
+"Hi!"	Planner
+"What's the weather?" (no city)	Planner asks for a location
+Agents
+🧭 Planner (planner_agent): the supervisor
+Called on every loop. It reads the state, observations and attempts, then picks the next worker or FinalResponse.
+Writes a task instruction for the worker. After a failure it must change the instruction (alternate spelling, country, different approach).
+Writes the final answer grounded only in collected data. If it returns an empty answer, a fallback composer writes one.
+Resets per-question state when a new user message arrives, so one city's data never leaks into another answer.
+Enforces guardrails (see Guardrails).
+📍 GeocodeWorker: autonomous geocoding agent
+MCP tool: geocode_location (Nominatim).
+Chooses the query, inspects candidates, and retries up to 3 times with other spellings, the English name, or a country.
+Reports through finish_geocoding(status, summary, latitude, longitude, place_name). Coordinates are validated (lat −90…90, lon −180…180) before use.
+If the model forgets to finish, the runtime salvages the top Nominatim match.
+🌡️ WeatherFetchWorker: autonomous weather agent
+MCP tools: get_forecast (current) and get_daily_forecast (1–7 days).
+The LLM picks the tool that fits the question (now vs tomorrow vs weekend), or both.
+Uses known coordinates or coordinates typed by the user, and never invents them. With none, it reports failure so the Planner can route to GeocodeWorker.
+Stores the raw tool outputs in raw_weather_payload.
+🛡️ SafetyWorker: hybrid rules + LLM agent
+MCP tool: assess_weather_risk, a deterministic rule engine (wind, precipitation, temperature, humidity thresholds).
+The LLM reads the numbers from the weather JSON, calls the tool, then adds context-specific alerts and a short summary through finish_safety.
+If no weather data exists yet, it fails immediately and the Planner replans to fetch weather first.
+MCP Tools and Data Sources
+
+All tools live in mcp_server.py (stdio transport).
+
+MCP tool	Called by	Data source	Purpose
+geocode_location(query, limit)	GeocodeWorker	Nominatim (OpenStreetMap): https://nominatim.openstreetmap.org/search	Place name → coordinates (JSON candidates)
+get_forecast(latitude, longitude)	WeatherFetchWorker	Open-Meteo: https://api.open-meteo.com/v1/forecast	Current temperature, humidity, wind speed, precipitation
+get_daily_forecast(latitude, longitude, days)	WeatherFetchWorker	Open-Meteo (daily variables)	Max/min temperature, precipitation sum, max wind for 1–7 days
+assess_weather_risk(temp, wind, precip, humidity)	SafetyWorker	Local rule engine (no network)	risk_level, drone_flight verdict, alerts
+
+Other components:
+
+Component	Role
+Groq openai/gpt-oss-20b (via get_groq_llm)	Worker agents: tool calling and the fallback final-answer composer
+Planner LLM (via get_structured_planner_llm)	Structured supervisor decisions (PlannerOutput)
+
+Notes:
+
+Nominatim and Open-Meteo are keyless. Nominatim policy: a valid User-Agent and at most about 1 request per second. The server enforces the rate limit and reads your contact from the NOMINATIM_USER_AGENT env var. Set it to a real address.
+NOMINATIM_URL and OPEN_METEO_URL env vars can override the endpoints (handy for tests or mocks).
+The risk thresholds are heuristics (for example drones: wind ≥ 40 km/h is NO-GO), not official aviation guidance.
+Sample tool output
+json
+{"source":"Open-Meteo","latitude":28.61,"longitude":77.21,"time":"2026-10-25T12:00",
+ "temperature_c":31.2,"humidity_pct":48,"wind_speed_kmh":12.5,"precipitation_mm":0.0}
+Replanning and Self-Correction
+
+Level 1: inside a worker (tool-level). The LLM sees a tool result and adapts.
+
+geocode_location("Dilli")  -> results: []  (hint: try another spelling)
+geocode_location("Delhi")  -> results: [Delhi, India ...]
+finish_geocoding(success, 28.61, 77.21)
+
+Level 2: across workers (plan-level). A failure is recorded as an observation and the Planner replans.
+
+[GeocodeWorker] FAILED: no results for 'Xyzzyville'
+Planner: retry with a different instruction ("try the nearest big city / ask for country")
+        …or FinalResponse: "I couldn't find that place, could you check the spelling or give coordinates?"
+
+Level 3: dependency repair. If SafetyWorker runs without weather, or WeatherFetchWorker runs without coordinates, it fails with a clear reason and the Planner routes to the missing prerequisite.
+
+Shared State
+
+AdvancedWeatherState in agents.py:
+
+Field	Meaning
+messages	Conversation history (user questions and final answers)
+observations	Log of worker outcomes, success and failure (the Planner's main input)
+attempts	Planner-level attempts per worker
+steps_taken	Worker dispatches in this question (budgeted)
+planned_for	Message count at question start, used to detect a new question
+worker_instruction	The Planner's instruction for the next worker
+target_location, coordinates	Resolved place and {lat, lon, name}
+raw_weather_payload	Raw MCP weather tool outputs
+safety_alerts, risk_report	Risk results
+next_node_decision	Routing key read by dynamic_router in workflow.py
+final_output	Reply returned to the user
+Project Structure
+weather_tool/
+├── app.py          # Streamlit chat UI (shows the agent trace)
+├── backend.py      # FastAPI server: POST /api/chat
+├── workflow.py     # LangGraph graph + router + MemorySaver (unchanged)
+├── agents.py       # Planner, 3 worker agents, tool-calling runtime
+├── mcp_server.py   # MCP server: 4 tools (stdio)
+├── llm_config.py   # LLM factories (Groq worker + structured planner)
+├── .env            # API keys (not committed)
+└── README.md
+Setup and Run
+Prerequisites
+Python 3.10+
+A Groq API key (or the provider your llm_config.py uses)
+The worker model must support tool calling (openai/gpt-oss-20b on Groq does)
+1. Install
+powershell
+python -m venv venv
+venv\Scripts\activate
+pip install langgraph langchain-core langchain-groq mcp httpx fastapi uvicorn pydantic python-dotenv streamlit
+2. Configure .env
+GROQ_API_KEY=your_key_here
+NOMINATIM_USER_AGENT=WeatherPlatform/1.0 (your-email@example.com)
+3. Run
+powershell
+python backend.py          # terminal 1: API on http://127.0.0.1:8000
+streamlit run app.py       # terminal 2: UI on http://localhost:8501
+
+The MCP server is not started manually. Each worker run spawns it over stdio.
+
+Sanity checks
+powershell
+# list the tools exposed by the MCP server
+python -c "import asyncio, agents; from mcp import ClientSession; from mcp.client.stdio import stdio_client
+async def m():
+    async with stdio_client(agents.mcp_params) as (r,w):
+        async with ClientSession(r,w) as s:
+            await s.initialize(); print([t.name for t in (await s.list_tools()).tools])
+asyncio.run(m())"
+
+Expected: ['geocode_location', 'get_forecast', 'get_daily_forecast', 'assess_weather_risk']
+
+API Reference
+POST /api/chat
+json
+{ "message": "Is it safe to fly a drone in Mumbai?", "session_id": "a1b2c3d4e5f6" }
+
+200
+
+json
+{
+  "logs": ["Planner","GeocodeWorker","Planner","WeatherFetchWorker","Planner","SafetyWorker","Planner"],
+  "response": "Conditions in Mumbai ..."
+}
+
+logs is the ordered list of graph nodes that ran. With replanning you may see repeated workers (retries). Reuse session_id for follow-ups.
+
+500 → { "detail": { "error_summary": "LangGraph Runtime Failure: ..." } }
+
+Example Walkthroughs
+
+"Is it safe to fly a drone in Dilli?"
+
+Planner: needs coordinates → GeocodeWorker.
+GeocodeWorker: geocode_location("Dilli") returns nothing → LLM retries geocode_location("Delhi") → success.
+Planner: have coordinates → WeatherFetchWorker calls get_forecast.
+Planner: need risk → SafetyWorker calls assess_weather_risk (for example wind 45 km/h → HIGH, NO-GO).
+Planner: all data collected → writes the final answer.
+
+"Weather in Xyzzyville" (cannot be found)
+
+GeocodeWorker tries several queries and reports failed.
+Planner replans: retry with a new instruction, or a final answer asking for the spelling or coordinates.
+A second failure hits the attempt cap → an honest final answer. There is no fake fallback city.
+Guardrails
+
+Autonomy is bounded so it can't loop or hallucinate silently.
+
+Guardrail	Value
+Max worker dispatches per question	8 (MAX_PLANNER_STEPS)
+Max planner-level attempts per worker	2 (MAX_WORKER_ATTEMPTS)
+Max LLM↔tool rounds per worker run	6 (MAX_TOOL_ROUNDS)
+Timeout per worker run	90 s (AGENT_TIMEOUT_SECONDS)
+LangGraph recursion limit / backend event cap	40 / 30
+Unknown worker name from the Planner	Treated as FinalResponse
+Worker crash (MCP down, LLM error)	Becomes a FAILED observation, so the graph never crashes with a 500
+Invalid coordinates from the LLM	Rejected by range validation
+Final answer	Must be grounded in collected data and observations
+Troubleshooting
+Worker shows ExceptionGroup or AttributeError ... inputSchema. MCP SDK v1 and v2 use different field names (inputSchema vs input_schema, isError vs is_error). agents.py handles both. Make sure you are on the latest file.
+Tool calling errors (tool_use_failed, 400). Confirm the worker model supports tool calling. Try another Groq model in get_groq_llm(model_name=...).
+MCP stdio hangs. Never print() to stdout inside mcp_server.py. Use stderr.
+Geocoding always empty. Check internet access and NOMINATIM_USER_AGENT. Nominatim blocks missing or generic user agents.
+Planner keeps looping. The guardrails stop it at 8 steps. Check the terminal for the 🧭 Planner: <reasoning> -> <worker> lines.
+UI says "Backend offline". Run python backend.py and check the Backend URL in the sidebar.
+Limitations and Ideas
+Each worker run spawns a fresh MCP subprocess (about 1–2 s). A long-lived MCP session managed by the FastAPI lifespan would cut latency.
+The Planner makes one LLM call per step, so it is smarter but slower and costlier than a fixed pipeline. Use a small, fast planner model.
+MemorySaver is in-memory. Swap in a SQLite or Postgres checkpointer to persist sessions.
+Streaming graph events (SSE) to the UI would show each agent and tool call live.
+Possible next tools: air quality, sunrise/sunset, hourly forecast, weather alerts, a no-fly-zone lookup.
